@@ -17,6 +17,12 @@
     "default": false,
     "hint": "启用后，对话历史从 chat_memory 插件按用户 ID 隔离读取（群内每个用户独立历史）。\n未启用时，从 AstrBot 自带上下文管理读取（群聊场景共享上下文）。\n⚠️ 启用前需先安装 chat_memory 插件，否则自动回退到 AstrBot 自带上下文。"
   },
+  "whitelist": {
+    "description": "白名单（跳过检测）",
+    "type": "list",
+    "default": [],
+    "hint": "QQ 号列表（list）。白名单内用户的消息跳过所有哨兵检测。"
+  },
   "log_config": {
     "description": "日志设置",
     "type": "object",

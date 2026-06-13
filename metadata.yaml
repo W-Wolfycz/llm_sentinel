@@ -1,6 +1,6 @@
 name: llm_sentinel
 display_name: "LLM 上下文哨兵"
-version: 1.0.0
+version: 1.1.0
 desc: "上下文安全哨兵 — 在 LLM 请求前检测性暗示、状态/时间线覆写等不当内容，可选参考近期对话历史识别连续越界模式，命中后向主模型注入安全警示。"
 author: Wolfycz
 help: "在 LLM 请求前自动检测用户输入中的不当内容（性暗示/亲密引导、括号动作覆写、时间线操控等）。支持参考近 N 轮对话历史（来自 chat_memory 插件或 AstrBot 自带上下文）识别渐进式越界，检测到后向主对话模型注入安全警示规则。"

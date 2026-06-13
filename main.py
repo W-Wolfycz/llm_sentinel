@@ -12,12 +12,6 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.message_components import Plain
 
-# chat_memory 可选依赖：启用 use_chat_memory 时按用户 ID 隔离读取历史
-try:
-    from chat_memory.main import query_history as _chat_memory_query
-except ImportError:
-    _chat_memory_query = None
-
 _TEMPLATE_NAMES = {
     "sexual": "性暗示/色情检测",
     "state_overwrite": "角色状态覆写检测",
@@ -37,7 +31,8 @@ class LLMSentinelPlugin(Star):
     _OUTPUT_FORMAT = (
         '\n\n只输出XML：'
         '<result><flagged>true或false</flagged>'
-        '<detail>引用检测到的具体内容，未检测到则输出"无"</detail></result>'
+        '<detail>引用检测到的具体原文片段（仅复制用户输入中的关键句段，不要改写不要补充，未检测到则输出"无"）；'
+        '若片段含 < > & 等 XML 特殊字符，必须转义为 &lt; &gt; &amp;</detail></result>'
     )
 
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -45,9 +40,8 @@ class LLMSentinelPlugin(Star):
 
         self.guard_provider = config.get("guard_provider", "")
         self.use_chat_memory = config.get("use_chat_memory", False)
-        if self.use_chat_memory and _chat_memory_query is None:
-            logger.warning("[LLMSentinel] 未找到 chat_memory 插件，回退到 AstrBot 自带上下文")
-            self.use_chat_memory = False
+        self._chat_memory = None  # 成功解析后缓存，失败不缓存以便下次重试
+        self.whitelist = self._load_whitelist(config.get("whitelist", []))
 
         log_conf = config.get("log_config", {})
         self.log_with_bot_id = log_conf.get("log_with_bot_id", False)
@@ -62,6 +56,29 @@ class LLMSentinelPlugin(Star):
             logger.info("[LLMSentinel] 未配置任何检测规则")
 
     # ── 日志 ────────────────────────────────────────────
+
+    def _resolve_chat_memory(self):
+        """定位 chat_memory 插件，返回带 query_history 方法的对象。
+        成功后缓存到 self._chat_memory；失败不缓存以便下次重试。
+        优先 AstrBot 插件注册表；失败则直接从 sys.modules 查找，绕过包导入路径问题。
+        """
+        if self._chat_memory is not None:
+            return self._chat_memory
+        try:
+            star = self.context.get_registered_star("chat_memory")
+            if star is not None:
+                for candidate in (star, getattr(star, "star", None), getattr(star, "star_cls", None)):
+                    if candidate is not None and hasattr(candidate, "query_history"):
+                        self._chat_memory = candidate
+                        return candidate
+        except Exception:
+            pass
+        import sys
+        mod = sys.modules.get("chat_memory.main") or sys.modules.get("chat_memory")
+        if mod is not None and hasattr(mod, "query_history"):
+            self._chat_memory = mod
+            return mod
+        return None
 
     def _tag(self, event=None) -> str:
         if self.log_with_bot_id and event is not None:
@@ -106,6 +123,13 @@ class LLMSentinelPlugin(Star):
     # ── 用户文本提取 ────────────────────────────────────
 
     @staticmethod
+    def _load_whitelist(raw) -> set[str]:
+        """严格 list 解析：非 list 或元素非字符串直接丢弃。"""
+        if not isinstance(raw, list):
+            return set()
+        return {str(x).strip() for x in raw if str(x).strip()}
+
+    @staticmethod
     def _extract_user_text(event: AstrMessageEvent) -> str:
         chain = getattr(event, "message_chain", None)
         if chain:
@@ -138,9 +162,15 @@ class LLMSentinelPlugin(Star):
         if rounds <= 0 or not conversation_id:
             return ""
 
-        if self.use_chat_memory and _chat_memory_query is not None:
+        chat_memory = self._resolve_chat_memory() if self.use_chat_memory else None
+        if self.use_chat_memory and chat_memory is None:
+            logger.warning(
+                f"{self._tag()} 未找到 chat_memory 插件，本次回退到 AstrBot 自带上下文"
+            )
+
+        if chat_memory is not None:
             try:
-                records = await _chat_memory_query(
+                records = await chat_memory.query_history(
                     umo, conversation_id, user_id, limit=rounds * 2
                 )
             except Exception as e:
@@ -228,6 +258,10 @@ class LLMSentinelPlugin(Star):
         if event.get_extra("sentinel_checked"):
             return
         event.set_extra("sentinel_checked", True)
+
+        if self.whitelist and event.get_sender_id() in self.whitelist:
+            self._log(event, f"用户 {event.get_sender_id()} 在白名单中，跳过检测")
+            return
 
         enabled_rules = [r for r in self.rules if r.get("enabled", True)]
         if not enabled_rules:
