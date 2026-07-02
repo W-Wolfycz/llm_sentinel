@@ -2,7 +2,9 @@
 
 import re
 import json
+import sys
 import asyncio
+from datetime import datetime
 import xml.etree.ElementTree as ET
 
 from astrbot.api import logger
@@ -11,6 +13,7 @@ from astrbot.api import AstrBotConfig
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.message_components import Plain
+from astrbot.core.agent.message import TextPart
 
 _TEMPLATE_NAMES = {
     "sexual": "性暗示/色情检测",
@@ -31,7 +34,7 @@ class LLMSentinelPlugin(Star):
     _OUTPUT_FORMAT = (
         '\n\n只输出XML：'
         '<result><flagged>true或false</flagged>'
-        '<detail>引用检测到的具体原文片段（仅复制用户输入中的关键句段，不要改写不要补充，未检测到则输出"无"）；'
+        '<detail>引用检测到的具体原文片段（仅复制用户输入中的关键句段，不要改写不要补充，未检测到则输出「无」）；'
         '若片段含 < > & 等 XML 特殊字符，必须转义为 &lt; &gt; &amp;</detail></result>'
     )
 
@@ -73,7 +76,6 @@ class LLMSentinelPlugin(Star):
                         return candidate
         except Exception:
             pass
-        import sys
         mod = sys.modules.get("chat_memory.main") or sys.modules.get("chat_memory")
         if mod is not None and hasattr(mod, "query_history"):
             self._chat_memory = mod
@@ -114,8 +116,9 @@ class LLMSentinelPlugin(Star):
                 rule.setdefault("id", tk)
                 rule.setdefault("name", _TEMPLATE_NAMES.get(tk, tk))
             else:
-                rule.setdefault("id", rule.get("rule_name", ""))
-                rule.setdefault("name", rule.get("rule_name", ""))
+                rule_name = rule.get("rule_name", "")
+                rule.setdefault("id", rule_name)
+                rule.setdefault("name", rule_name)
             if LLMSentinelPlugin._validate_rule(rule):
                 normalized.append(rule)
         return normalized
@@ -147,31 +150,54 @@ class LLMSentinelPlugin(Star):
         match = re.search(r"<result>.*?</result>", raw, re.DOTALL)
         if not match:
             return False, ""
-        root = ET.fromstring(match.group(0))
+        try:
+            root = ET.fromstring(match.group(0))
+        except ET.ParseError:
+            return False, ""
         flagged = (root.findtext("flagged") or "false").strip().lower() == "true"
         detail = (root.findtext("detail") or "").strip()
         return flagged, detail
 
     # ── 对话历史 ────────────────────────────────────────
 
+    def _ts_tag(self, record: dict) -> str:
+        """从记录中提取时间戳标签 (MM-DD HH:MM)；无 created_at 或解析失败时返回空串。"""
+        created = record.get("created_at")
+        if not created:
+            return ""
+        try:
+            dt = datetime.strptime(str(created)[:19], "%Y-%m-%d %H:%M:%S")
+            return dt.strftime("(%m-%d %H:%M)")
+        except (ValueError, TypeError):
+            return ""
+
     async def _get_recent_history(
         self, umo: str, user_id: str, conversation_id: str,
         current_user_text: str = "", rounds: int = 0,
+        mode: str = "all",
     ) -> str:
-        """获取最近 N 轮对话历史（user + assistant 配对），返回纯文本（无 <history> 包裹）。"""
+        """获取最近 N 轮对话历史，返回纯文本（无 <history> 包裹）。
+
+        mode:
+          - "all": user + assistant 配对（默认）
+          - "user_only": 仅用户发言，按时间顺序列出
+          - "ai_only": 仅 AI 回复，按时间顺序列出
+        """
         if rounds <= 0 or not conversation_id:
             return ""
 
         chat_memory = self._resolve_chat_memory() if self.use_chat_memory else None
         if self.use_chat_memory and chat_memory is None:
-            logger.warning(
+            logger.debug(
                 f"{self._tag()} 未找到 chat_memory 插件，本次回退到 AstrBot 自带上下文"
             )
 
         if chat_memory is not None:
             try:
+                # 单类型 mode 时拉更多条补偿过滤损失（每 2 条混合记录约含 1 条目标类型）
+                fetch_limit = rounds * 2 if mode == "all" else rounds * 4
                 records = await chat_memory.query_history(
-                    umo, conversation_id, user_id, limit=rounds * 2
+                    umo, conversation_id, user_id, limit=fetch_limit
                 )
             except Exception as e:
                 logger.warning(f"{self._tag()} chat_memory 读取失败: {e}")
@@ -187,17 +213,44 @@ class LLMSentinelPlugin(Star):
             if records[-1].get("content", "").strip() == current_user_text.strip():
                 records = records[:-1]
 
-        # 只保留最近 N 轮（每轮 = user + assistant）
-        records = records[-(rounds * 2):]
+        if mode == "user_only":
+            wanted = "user"
+        elif mode == "ai_only":
+            wanted = "assistant"
+        else:
+            wanted = None
 
-        # 配对格式化
+        if wanted:
+            filtered = [r for r in records if r.get("role") == wanted]
+            # 只保留最近 N 条（每轮 = 1 条）
+            filtered = filtered[-rounds:]
+            label = "用户" if wanted == "user" else "角色"
+            lines = []
+            for idx, r in enumerate(filtered, 1):
+                ts = self._ts_tag(r)
+                prefix = f"[{idx}] {ts} {label}" if ts else f"[{idx}] {label}"
+                lines.append(f"{prefix}: {r.get('content', '')}")
+            return "\n".join(lines)
+
+        # 默认：配对格式（user + assistant）——重新配对以应对 user-user-assistant 等非严格交替
+        pairs = []
+        pending_user = None
+        for r in records[-(rounds * 2):]:
+            role = r.get("role")
+            if role == "user":
+                pending_user = r
+            elif role == "assistant" and pending_user is not None:
+                pairs.append((pending_user, r))
+                pending_user = None
+        pairs = pairs[-rounds:]
         lines = []
-        for i in range(0, len(records) - 1, 2):
-            idx = i // 2 + 1
-            user_msg = records[i].get("content", "")
-            bot_msg = records[i + 1].get("content", "")
-            lines.append(f"[{idx}] 用户: {user_msg}")
-            lines.append(f"[{idx}] 角色: {bot_msg}")
+        for idx, (u, a) in enumerate(pairs, 1):
+            user_ts = self._ts_tag(u)
+            bot_ts = self._ts_tag(a)
+            user_prefix = f"[{idx}] {user_ts} 用户" if user_ts else f"[{idx}] 用户"
+            bot_prefix = f"[{idx}] {bot_ts} 角色" if bot_ts else f"[{idx}] 角色"
+            lines.append(f"{user_prefix}: {u.get('content', '')}")
+            lines.append(f"{bot_prefix}: {a.get('content', '')}")
         return "\n".join(lines)
 
     async def _read_astrbot_history(self, umo: str, conversation_id: str) -> list[dict]:
@@ -229,9 +282,9 @@ class LLMSentinelPlugin(Star):
         self, event: AstrMessageEvent, user_text: str, rule: dict,
         provider_id: str, history_block: str,
     ) -> tuple[bool, str]:
-        # 每条规则独立的 min_check_length 过滤（0=不启用）
+        # min_check_length 仅对分析用户输入的规则生效；ai_only 模式 user_text 为空时跳过此过滤
         min_len = max(0, rule.get("min_check_length", 0))
-        if min_len > 0 and len(user_text) < min_len:
+        if min_len > 0 and user_text and len(user_text) < min_len:
             return False, ""
 
         prompt = (rule["check_prompt"]
@@ -268,8 +321,8 @@ class LLMSentinelPlugin(Star):
             return
 
         user_text = self._extract_user_text(event)
-        if not user_text:
-            return
+        # 不在此处因 user_text 空就 return：ai_only 规则可能只依赖历史，不分析当前输入
+        # 后续 (text_val.strip() or hist_block.strip()) 过滤会处理全空情况
 
         umo = getattr(event, "unified_msg_origin", "")
         if self.guard_provider:
@@ -289,32 +342,64 @@ class LLMSentinelPlugin(Star):
         except Exception:
             cid = ""
 
-        history_blocks: dict[int, str] = {}
-        for rule in enabled_rules:
-            rounds = max(0, min(10, rule.get("history_rounds", 0)))
-            if rounds in history_blocks:
-                continue
-            if rounds > 0 and cid:
-                history_text = await self._get_recent_history(
-                    umo, user_id, cid, user_text, rounds
-                )
-                history_blocks[rounds] = (
-                    f"<history>\n{history_text}\n</history>" if history_text else ""
-                )
-            else:
-                history_blocks[rounds] = ""
+        # history_source 取值：both / user_only / ai_only
+        # both → 内部 mode "all"（user+assistant 配对）
+        # user_only → 仅用户历史
+        # ai_only → 仅 AI 历史，且 {text}（用户当前输入）会被置空
+        _HISTORY_MODE_MAP = {
+            "both": "all",
+            "user_only": "user_only",
+            "ai_only": "ai_only",
+        }
 
-        tasks = [
-            self._check(
-                event, user_text, r, provider_id,
-                history_blocks[max(0, min(10, r.get("history_rounds", 0)))]
+        history_cache: dict[tuple[int, str], str] = {}
+
+        async def get_history_text(rounds: int, mode: str) -> str:
+            if rounds <= 0 or not cid:
+                return ""
+            key = (rounds, mode)
+            if key in history_cache:
+                return history_cache[key]
+            # ai_only 模式下不需要在去重时引用 current_user_text
+            dedup_text = user_text if mode != "ai_only" else ""
+            text = await self._get_recent_history(
+                umo, user_id, cid, dedup_text, rounds, mode=mode
             )
-            for r in enabled_rules
+            history_cache[key] = text
+            return text
+
+        # 按规则构造 (text_value, history_block) 二元组
+        rule_inputs: list[tuple[dict, str, str]] = []  # (rule, text_value, history_block)
+        for r in enabled_rules:
+            source = r.get("history_source", "both")
+            mode = _HISTORY_MODE_MAP.get(source, "all")
+            rounds = max(0, min(10, r.get("history_rounds", 0)))
+            # 拉历史
+            if rounds > 0 and cid:
+                hist_text = await get_history_text(rounds, mode)
+                hist_block = f"<history>\n{hist_text}\n</history>" if hist_text else ""
+            else:
+                hist_block = ""
+            # 决定 {text}：ai_only 模式下置空（不分析当前用户输入）
+            text_val = "" if source == "ai_only" else user_text
+            rule_inputs.append((r, text_val, hist_block))
+
+        # 过滤：text 与 history 全空则跳过（无内容可分析）
+        tasks = [
+            self._check(event, text_val, r, provider_id, hist_block)
+            for (r, text_val, hist_block) in rule_inputs
+            if text_val.strip() or hist_block.strip()
         ]
+        if not tasks:
+            return
         results = await asyncio.gather(*tasks)
+        checked_rules = [
+            r for (r, text_val, hist_block) in rule_inputs
+            if text_val.strip() or hist_block.strip()
+        ]
 
         warnings = []
-        for rule, (flagged, detail) in zip(enabled_rules, results):
+        for rule, (flagged, detail) in zip(checked_rules, results):
             if flagged:
                 tpl = rule.get("warning_template", "")
                 warnings.append(
@@ -324,5 +409,9 @@ class LLMSentinelPlugin(Star):
                 logger.info(f"{self._tag(event)} '{rule['name']}' 触发: {detail}")
 
         if warnings:
-            req.system_prompt = (req.system_prompt or "") + "\n\n" + "\n\n".join(warnings)
+            part = TextPart(text="\n\n".join(warnings))
+            mark_as_temp = getattr(part, "mark_as_temp", None)
+            if callable(mark_as_temp):
+                part = mark_as_temp()
+            req.extra_user_content_parts.append(part)
             self._log(event, f"已注入 {len(warnings)} 条警示")
